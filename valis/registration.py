@@ -2244,6 +2244,11 @@ class Valis(object):
                 else:
                     thumbnail_img = self.create_thumbnail(processed_img)
 
+                original_dir = os.path.join(os.path.dirname(self.mask_dir), 'original')
+                pathlib.Path(original_dir).mkdir(exist_ok=True, parents=True)
+                original_f_out = os.path.join(original_dir, f'{slide_obj.name}.png')
+                warp_tools.save_img(original_f_out, thumbnail_img)
+
                 thumbnail_mask_outline = viz.draw_outline(thumbnail_img, thumbnail_mask)
                 outline_f_out = os.path.join(self.mask_dir, f'{slide_obj.name}.png')
                 warp_tools.save_img(outline_f_out, thumbnail_mask_outline)
