@@ -1,26 +1,28 @@
 """Classes and functions to perform serial rigid registration of a set of images
 
 """
-import numpy as np
-import os
-import pickle
-from fastcluster import linkage
-from scipy.spatial.distance import squareform
-from scipy.cluster.hierarchy import optimal_leaf_ordering, leaves_list
-from skimage import transform, io
-from skimage.transform import EuclideanTransform
-import pandas as pd
-import warnings
 import imghdr
-from tqdm import tqdm
-import pathlib
 import multiprocessing
-from joblib import Parallel, delayed, parallel_backend
+import os
+import pathlib
+import pickle
+import warnings
 from time import time
-from . import valtils
-from . import warp_tools
+
+import numpy as np
+import pandas as pd
+from fastcluster import linkage
+from joblib import Parallel, delayed, parallel_backend
+from scipy.cluster.hierarchy import leaves_list, optimal_leaf_ordering
+from scipy.spatial.distance import squareform
+from skimage import io, transform
+from skimage.transform import EuclideanTransform
+from tqdm import tqdm
+
+from . import valtils, warp_tools
 from .feature_detectors import VggFD
-from .feature_matcher import Matcher, convert_distance_to_similarity, GMS_NAME
+from .feature_matcher import GMS_NAME, Matcher, convert_distance_to_similarity
+
 
 def get_image_files(img_dir, imgs_ordered=False):
     """Get images filenames in img_dir
@@ -47,8 +49,7 @@ def get_image_files(img_dir, imgs_ordered=False):
 
     """
 
-    img_list = [f for f in os.listdir(img_dir) if
-                imghdr.what(os.path.join(img_dir, f)) is not None]
+    img_list = [f for f in os.listdir(img_dir) if imghdr.what(os.path.join(img_dir, f)) is not None]
 
     if imgs_ordered:
         valtils.sort_nicely(img_list)
@@ -81,7 +82,7 @@ def get_max_image_dimensions(img_list):
 
 
 def order_Dmat(D):
-    """ Cluster distance matrix and sort
+    """Cluster distance matrix and sort
 
     Leaf sorting is accomplished using optimal leaf ordering (Bar-Joseph 2001)
 
@@ -106,7 +107,7 @@ def order_Dmat(D):
 
     D = D.copy()
     sq_D = squareform(D)
-    Z = linkage(sq_D, 'single', preserve_input=True)
+    Z = linkage(sq_D, "single", preserve_input=True)
 
     optimal_Z = optimal_leaf_ordering(Z, sq_D)
     ordered_leaves = leaves_list(optimal_Z)
@@ -178,6 +179,9 @@ class ZImage(object):
     to_prev_A : ndarray
         Transformation matrix that warps image to align with the previous image
 
+    to_ref_A : ndarray
+        Transformation matrix that warps image to align with the reference image
+
     optimal_M : ndarray
         Transformation matrix found by minimizing a cost function.
         Used as final optional step to refine alignment
@@ -241,6 +245,7 @@ class ZImage(object):
         self.reflection_M = np.identity(3)
         self.T = np.identity(3)
         self.to_prev_A = np.identity(3)
+        self.to_ref_A = np.identity(3)
         self.optimal_M = np.identity(3)
         self.crop_T = np.identity(3)
         self.M = np.identity(3)
@@ -389,8 +394,15 @@ class SerialRigidRegistrar(object):
 
     """
 
-    def __init__(self, img_dir, imgs_ordered=False, reference_img_f=None,
-                 name=None, align_to_reference=False):
+    def __init__(
+        self,
+        img_dir,
+        imgs_ordered=False,
+        reference_img_f=None,
+        name=None,
+        align_to_reference=False,
+        compose_transforms=False,
+    ):
         """Class that performs serial rigid registration
 
         Parameters
@@ -422,6 +434,15 @@ class SerialRigidRegistrar(object):
             specified by `reference_img_f`. Will be set to True if
             `reference_img_f` is provided.
 
+        compose_transforms: bool, optional
+            Whether or not to compose rigid transformations. If `True`,
+            then an image is rigidly warped an aligned with the reference slide
+            before aligning to the adjacent image. This allows the transformations
+            to accumulate, which may bring distant features together but could
+            also  result  in un-wanted deformations. If `False`, the image
+            not warped before is used as the reference for the adjacent image
+            to be registered to.
+
         """
         self.img_dir = img_dir
         self.aleady_sorted = imgs_ordered
@@ -439,6 +460,7 @@ class SerialRigidRegistrar(object):
         self.similarity_mat = None
         self.features = None
         self.transform_type = None
+        self.compose_transforms = compose_transforms
 
         self.reference_img_f = reference_img_f
         self.reference_img_idx = 0
@@ -449,13 +471,13 @@ class SerialRigidRegistrar(object):
 
         if self.align_to_reference is False and reference_img_f is not None:
             og_ref_name = valtils.get_name(reference_img_f)
-            msg = (f"The reference was specified as {og_ref_name} ",
-                   f"but `align_to_reference` is `False`, and so images will be aligned serially. ",
-                   f"If you would like all images to be directly aligned to {og_ref_name}, "
-                   f"then set `align_to_reference` to `True`")
+            msg = (
+                f"The reference was specified as {og_ref_name} ",
+                f"but `align_to_reference` is `False`, and so images will be aligned serially. ",
+                f"If you would like all images to be directly aligned to {og_ref_name}, "
+                f"then set `align_to_reference` to `True`",
+            )
             valtils.print_warning(msg)
-
-
 
     def generate_img_obj_list(self, feature_detector, qt_emitter=None):
         """Create a list of ZImage objects
@@ -476,14 +498,13 @@ class SerialRigidRegistrar(object):
         """
 
         # NOTE tried parallelizing with joblib, but it's actually slower  #
-        sorted_img_list = [io.imread(os.path.join(self.img_dir, f), True)
-                           for f in self.img_file_list]
+        sorted_img_list = [io.imread(os.path.join(self.img_dir, f), True) for f in self.img_file_list]
 
         out_w, out_h = get_max_image_dimensions(sorted_img_list)
 
         # Get dimensions if images were rotated 45 degrees or 90 degrees
-        max_new_w = out_w*np.cos(45) + out_h*np.sin(45)
-        max_new_h = out_w*np.sin(45) + out_h*np.cos(45)
+        max_new_w = out_w * np.cos(45) + out_h * np.sin(45)
+        max_new_h = out_w * np.sin(45) + out_h * np.cos(45)
 
         max_dist = np.ceil(np.max([out_w, out_h, max_new_h, max_new_w])).astype(np.int)
         out_shape = (max_dist, max_dist)
@@ -528,18 +549,24 @@ class SerialRigidRegistrar(object):
             if i == 0:
                 return None
             img_obj_1 = self.img_obj_list[i]
-            img_obj_2 = self.img_obj_list[i-1]
+            img_obj_2 = self.img_obj_list[i - 1]
 
             if matcher_obj.match_filter_method == GMS_NAME:
-                filter_kwargs = {"img1_shape":img_obj_1.image.shape[0:2], "img2_shape": img_obj_2.image.shape[0:2]}
+                filter_kwargs = {"img1_shape": img_obj_1.image.shape[0:2], "img2_shape": img_obj_2.image.shape[0:2]}
             else:
                 filter_kwargs = None
-            unfiltered_match_info12, filtered_match_info12, unfiltered_match_info21, filtered_match_info21 = \
-                matcher_obj.match_images(img_obj_1.desc, img_obj_1.kp_pos_xy,
-                                            img_obj_2.desc, img_obj_2.kp_pos_xy,
-                                            filter_kwargs)
+            (
+                unfiltered_match_info12,
+                filtered_match_info12,
+                unfiltered_match_info21,
+                filtered_match_info21,
+            ) = matcher_obj.match_images(
+                img_obj_1.desc, img_obj_1.kp_pos_xy, img_obj_2.desc, img_obj_2.kp_pos_xy, filter_kwargs
+            )
             if len(filtered_match_info12.matched_kp1_xy) == 0:
-                warnings.warn(f"{len(filtered_match_info12.matched_kp1_xy)} between {img_obj_1.name} and {img_obj_2.name}")
+                warnings.warn(
+                    f"{len(filtered_match_info12.matched_kp1_xy)} between {img_obj_1.name} and {img_obj_2.name}"
+                )
 
             # Update match dictionaries
             if keep_unfiltered:
@@ -556,7 +583,7 @@ class SerialRigidRegistrar(object):
             img_obj_2.match_dict[img_obj_1] = filtered_match_info21
 
             if qt_emitter is not None:
-                    qt_emitter.emit(1)
+                qt_emitter.emit(1)
 
         n_cpu = multiprocessing.cpu_count() - 1
         with parallel_backend("threading", n_jobs=n_cpu):
@@ -580,24 +607,33 @@ class SerialRigidRegistrar(object):
 
         """
 
-        n_comparisions = int((self.size*(self.size-1))/2)
+        n_comparisions = int((self.size * (self.size - 1)) / 2)
         pbar = tqdm(total=n_comparisions)
 
         def match_img_obj(i):
             img_obj_1 = self.img_obj_list[i]
-            for j in np.arange(i+1, self.size):
+            for j in np.arange(i + 1, self.size):
                 img_obj_2 = self.img_obj_list[j]
                 if matcher_obj.match_filter_method == GMS_NAME:
-                    filter_kwargs = {"img1_shape":img_obj_1.image.shape[0:2], "img2_shape": img_obj_2.image.shape[0:2]}
+                    filter_kwargs = {
+                        "img1_shape": img_obj_1.image.shape[0:2],
+                        "img2_shape": img_obj_2.image.shape[0:2],
+                    }
                 else:
                     filter_kwargs = None
 
-                unfiltered_match_info12, filtered_match_info12, unfiltered_match_info21, filtered_match_info21 = \
-                    matcher_obj.match_images(img_obj_1.desc, img_obj_1.kp_pos_xy,
-                                                img_obj_2.desc, img_obj_2.kp_pos_xy,
-                                                filter_kwargs)
+                (
+                    unfiltered_match_info12,
+                    filtered_match_info12,
+                    unfiltered_match_info21,
+                    filtered_match_info21,
+                ) = matcher_obj.match_images(
+                    img_obj_1.desc, img_obj_1.kp_pos_xy, img_obj_2.desc, img_obj_2.kp_pos_xy, filter_kwargs
+                )
                 if len(filtered_match_info12.matched_kp1_xy) == 0:
-                    warnings.warn(f"{len(filtered_match_info12.matched_kp1_xy)} between {img_obj_1.name} and {img_obj_2.name}")
+                    warnings.warn(
+                        f"{len(filtered_match_info12.matched_kp1_xy)} between {img_obj_1.name} and {img_obj_2.name}"
+                    )
                 # Update match dictionaries #
                 if keep_unfiltered:
                     unfiltered_match_info12.set_names(img_obj_1.name, img_obj_2.name)
@@ -638,7 +674,7 @@ class SerialRigidRegistrar(object):
         xy_to_prev_idx = warp_tools.index2d_to_1d(xy_to_prev[:, 1], xy_to_prev[:, 0], img_obj.image.shape[1])
         xy_to_next_idx = warp_tools.index2d_to_1d(xy_to_next[:, 1], xy_to_next[:, 0], img_obj.image.shape[1])
 
-        shared_pts, nf_prev_idx, nf_next_idx  = np.intersect1d(xy_to_prev_idx, xy_to_next_idx, return_indices=True)
+        shared_pts, nf_prev_idx, nf_next_idx = np.intersect1d(xy_to_prev_idx, xy_to_next_idx, return_indices=True)
 
         # trying to remove diff features if they are different... (possible due to some very rare rounding errors?)
         diff = np.where(xy_to_prev[nf_prev_idx, :] != xy_to_next[nf_next_idx, :])
@@ -649,24 +685,22 @@ class SerialRigidRegistrar(object):
 
         return nf_prev_idx, nf_next_idx
 
-
     def get_common_desc(self, current_img_obj, neighbor_obj, nf_kp_idx):
         """Get descriptors that correspond to filtered neighbor points
-            Parameters
-            ----------
-            nf_kp_idx : ndarray
-                Indicies of already matched keypoints that were found after
-                neighbonr filtering
+        Parameters
+        ----------
+        nf_kp_idx : ndarray
+            Indicies of already matched keypoints that were found after
+            neighbonr filtering
         """
 
         neighbor_match_info12 = current_img_obj.match_dict[neighbor_obj]
         nf_kp = neighbor_match_info12.matched_kp1_xy[nf_kp_idx]
         nf_desc = neighbor_match_info12.matched_desc1[nf_kp_idx]
 
-        return  nf_desc, nf_kp
+        return nf_desc, nf_kp
 
-    def neighbor_match_filtering(self, img_obj, prev_img_obj, next_img_obj,
-                                 tform, matcher_obj):
+    def neighbor_match_filtering(self, img_obj, prev_img_obj, next_img_obj, tform, matcher_obj):
         """Remove poor matches by keeping only the matches found in neighbors
 
         Parameters
@@ -706,16 +740,14 @@ class SerialRigidRegistrar(object):
         """
 
         def measure_d(src_xy, dst_xy, tform, M=None):
-            """Measure distance between warped corresponding points
-            """
+            """Measure distance between warped corresponding points"""
             if M is None:
                 tform.estimate(src=dst_xy, dst=src_xy)
                 M = tform.params
             warped_xy = warp_tools.warp_xy(src_xy, M)
-            d = np.median(warp_tools.calc_d(warped_xy,  dst_xy))
+            d = np.median(warp_tools.calc_d(warped_xy, dst_xy))
 
             return d, M
-
 
         nf_prev_idx, nf_next_idx = self.get_neighbor_matches_idx(img_obj, prev_img_obj, next_img_obj)
         to_prev_match_info12 = img_obj.match_dict[prev_img_obj]
@@ -732,17 +764,13 @@ class SerialRigidRegistrar(object):
             common_prev_kp = to_prev_match_info12.matched_kp2_xy[nf_prev_idx]
             common_next_kp = to_next_match_info12.matched_kp2_xy[nf_next_idx]
 
-            common_matches_d, common_matches_M = measure_d(common_kp,
-                                                           common_prev_kp,
-                                                           tform)
+            common_matches_d, common_matches_M = measure_d(common_kp, common_prev_kp, tform)
 
-            original_d, _ = measure_d(to_prev_match_info12.matched_kp1_xy,
-                                      to_prev_match_info12.matched_kp2_xy,
-                                      tform)
+            original_d, _ = measure_d(to_prev_match_info12.matched_kp1_xy, to_prev_match_info12.matched_kp2_xy, tform)
 
-            original_with_neighbor_filter_d, _ = measure_d(to_prev_match_info12.matched_kp1_xy,
-                                                           to_prev_match_info12.matched_kp2_xy,
-                                                           tform, M=common_matches_M)
+            original_with_neighbor_filter_d, _ = measure_d(
+                to_prev_match_info12.matched_kp1_xy, to_prev_match_info12.matched_kp2_xy, tform, M=common_matches_M
+            )
 
             if common_matches_d < original_d and original_with_neighbor_filter_d <= original_d:
                 # neighbor filtering improved alignment
@@ -757,17 +785,13 @@ class SerialRigidRegistrar(object):
                 filtered_next_desc, filtered_next_kp = self.get_common_desc(next_img_obj, img_obj, nf_next_idx)
                 assert np.all(common_next_kp == filtered_next_kp)
 
-                updated_prev_match_info12, _, updated_prev_match_info21, _ = \
-                    matcher_obj.match_images(desc1=filtered_desc,
-                                             kp1_xy=filtered_kp,
-                                             desc2=filtered_prev_desc,
-                                             kp2_xy=filtered_prev_kp)
+                updated_prev_match_info12, _, updated_prev_match_info21, _ = matcher_obj.match_images(
+                    desc1=filtered_desc, kp1_xy=filtered_kp, desc2=filtered_prev_desc, kp2_xy=filtered_prev_kp
+                )
 
-                updated_next_match_info12, _, updated_next_match_info21, _ = \
-                    matcher_obj.match_images(desc1=_filtered_desc,
-                                             kp1_xy=_filtered_kp,
-                                             desc2=filtered_next_desc,
-                                             kp2_xy=filtered_next_kp)
+                updated_next_match_info12, _, updated_next_match_info21, _ = matcher_obj.match_images(
+                    desc1=_filtered_desc, kp1_xy=_filtered_kp, desc2=filtered_next_desc, kp2_xy=filtered_next_kp
+                )
 
         if improved:
             return improved, updated_prev_match_info12, updated_next_match_info12
@@ -797,9 +821,9 @@ class SerialRigidRegistrar(object):
 
             next_idx = i + 1
             next_img_obj = self.img_obj_list[next_idx]
-            improved, updated_prev_match_info12, updated_next_match_info12 = \
-                self.neighbor_match_filtering(img_obj, prev_img_obj,
-                                              next_img_obj, tform, matcher_obj)
+            improved, updated_prev_match_info12, updated_next_match_info12 = self.neighbor_match_filtering(
+                img_obj, prev_img_obj, next_img_obj, tform, matcher_obj
+            )
 
             if improved:
                 new_matches[img_obj.name] = [updated_prev_match_info12, updated_next_match_info12]
@@ -817,7 +841,6 @@ class SerialRigidRegistrar(object):
             img_obj_new_matches = new_matches[img_obj.name]
             img_obj.match_dict[prev_img_obj] = img_obj_new_matches[0]
             img_obj.match_dict[next_img_obj] = img_obj_new_matches[1]
-
 
     def build_metric_matrix(self, metric="n_matches"):
         """Create metric matrix based image similarity/distance
@@ -858,7 +881,7 @@ class SerialRigidRegistrar(object):
         max_d = distance_mat.max()
 
         # Make sure that image has highest similarity with itself
-        similarity_mat[np.diag_indices_from(similarity_mat)] += max_s*0.01
+        similarity_mat[np.diag_indices_from(similarity_mat)] += max_s * 0.01
 
         # Scale metrics between 0 and 1
         similarity_mat = (similarity_mat - min_s) / (max_s - min_s)
@@ -911,7 +934,9 @@ class SerialRigidRegistrar(object):
             prev_img_obj = self.img_obj_list[fixed_idx]
             img_obj.fixed_obj = prev_img_obj
 
-    def align_to_prev_check_reflections(self, transformer, feature_detector, matcher_obj, keep_unfiltered=False, qt_emitter=None):
+    def align_to_prev_check_reflections(
+        self, transformer, feature_detector, matcher_obj, keep_unfiltered=False, qt_emitter=None
+    ):
         """Use key points to align current image to previous image in the stack, but checking if reflection improves alignment
 
         Parameters
@@ -939,11 +964,17 @@ class SerialRigidRegistrar(object):
             img_obj = self.img_obj_list[moving_idx]
             prev_img_obj = self.img_obj_list[fixed_idx]
 
-            if fixed_idx == self.reference_img_idx:
-                prev_M = ref_img_obj.T.copy()
+            if self.compose_transforms:
+                if fixed_idx == self.reference_img_idx:
+                    prev_M = ref_img_obj.T.copy()
+
+                prev_to_ref_A = np.identity(3)
+            else:
+                prev_M = prev_img_obj.reflection_M.copy() @ prev_img_obj.T.copy()
+                prev_to_ref_A = prev_img_obj.to_ref_A
 
             if matcher_obj.match_filter_method == GMS_NAME:
-                    filter_kwargs = {"img1_shape":img_obj.image.shape[0:2], "img2_shape": prev_img_obj.image.shape[0:2]}
+                filter_kwargs = {"img1_shape": img_obj.image.shape[0:2], "img2_shape": prev_img_obj.image.shape[0:2]}
             else:
                 filter_kwargs = None
 
@@ -951,7 +982,9 @@ class SerialRigidRegistrar(object):
             to_prev_match_info = img_obj.match_dict[prev_img_obj]
             transformer.estimate(to_prev_match_info.matched_kp2_xy, to_prev_match_info.matched_kp1_xy)
             unreflected_warped_src_xy = warp_tools.warp_xy(to_prev_match_info.matched_kp1_xy, transformer.params)
-            _,  unreflected_d = warp_tools.measure_error(to_prev_match_info.matched_kp2_xy, unreflected_warped_src_xy, prev_img_obj.image.shape)
+            _, unreflected_d = warp_tools.measure_error(
+                to_prev_match_info.matched_kp2_xy, unreflected_warped_src_xy, prev_img_obj.image.shape
+            )
 
             reflected_d_vals = [unreflected_d]
             reflection_M = [np.eye(3)]
@@ -971,18 +1004,30 @@ class SerialRigidRegistrar(object):
                         continue
 
                     rM = warp_tools.get_reflection_M(rx, ry, img_obj.image.shape)
-                    reflected_img = warp_tools.warp_img(img_obj.image, rM @ img_obj.T, out_shape_rc=img_obj.padded_shape_rc)
+                    reflected_img = warp_tools.warp_img(
+                        img_obj.image, rM @ img_obj.T, out_shape_rc=img_obj.padded_shape_rc
+                    )
 
                     reflected_src_xy, reflected_desc = feature_detector.detect_and_compute(reflected_img)
 
-                    unfiltered_match_info12, filtered_match_info12, unfiltered_match_info21, filtered_match_info21 = \
-                        matcher_obj.match_images(reflected_desc, reflected_src_xy,
-                                                    prev_img_obj.desc, dst_xy,
-                                                    filter_kwargs)
+                    (
+                        unfiltered_match_info12,
+                        filtered_match_info12,
+                        unfiltered_match_info21,
+                        filtered_match_info21,
+                    ) = matcher_obj.match_images(
+                        reflected_desc, reflected_src_xy, prev_img_obj.desc, dst_xy, filter_kwargs
+                    )
 
                     # Record info #
-                    _ = transformer.estimate(filtered_match_info12.matched_kp2_xy, filtered_match_info12.matched_kp1_xy)
-                    _,  reflected_d = warp_tools.measure_error(filtered_match_info12.matched_kp2_xy, filtered_match_info12.matched_kp1_xy, prev_img_obj.padded_shape_rc)
+                    _ = transformer.estimate(
+                        filtered_match_info12.matched_kp2_xy, filtered_match_info12.matched_kp1_xy
+                    )
+                    _, reflected_d = warp_tools.measure_error(
+                        filtered_match_info12.matched_kp2_xy,
+                        filtered_match_info12.matched_kp1_xy,
+                        prev_img_obj.padded_shape_rc,
+                    )
                     reflected_d_vals.append(reflected_d)
                     reflection_M.append(rM)
                     transforms.append(transformer.params)
@@ -991,21 +1036,37 @@ class SerialRigidRegistrar(object):
                     img_inv_M = np.linalg.inv(rM @ img_obj.T)
                     prev_img_inv_M = np.linalg.inv(prev_M)
 
-                    filtered_match_info12.matched_kp1_xy = warp_tools.warp_xy(filtered_match_info12.matched_kp1_xy, img_inv_M)
-                    filtered_match_info12.matched_kp2_xy = warp_tools.warp_xy(filtered_match_info12.matched_kp2_xy, prev_img_inv_M)
+                    filtered_match_info12.matched_kp1_xy = warp_tools.warp_xy(
+                        filtered_match_info12.matched_kp1_xy, img_inv_M
+                    )
+                    filtered_match_info12.matched_kp2_xy = warp_tools.warp_xy(
+                        filtered_match_info12.matched_kp2_xy, prev_img_inv_M
+                    )
 
-                    filtered_match_info21.matched_kp1_xy = warp_tools.warp_xy(filtered_match_info21.matched_kp1_xy, prev_img_inv_M)
-                    filtered_match_info21.matched_kp2_xy = warp_tools.warp_xy(filtered_match_info21.matched_kp2_xy, img_inv_M)
+                    filtered_match_info21.matched_kp1_xy = warp_tools.warp_xy(
+                        filtered_match_info21.matched_kp1_xy, prev_img_inv_M
+                    )
+                    filtered_match_info21.matched_kp2_xy = warp_tools.warp_xy(
+                        filtered_match_info21.matched_kp2_xy, img_inv_M
+                    )
 
                     reflected_matches12.append(filtered_match_info12)
                     reflected_matches21.append(filtered_match_info21)
 
                     if keep_unfiltered:
-                        unfiltered_match_info12.matched_kp1_xy = warp_tools.warp_xy(unfiltered_match_info12.matched_kp1_xy, img_inv_M)
-                        unfiltered_match_info12.matched_kp2_xy = warp_tools.warp_xy(unfiltered_match_info12.matched_kp2_xy, prev_img_inv_M)
+                        unfiltered_match_info12.matched_kp1_xy = warp_tools.warp_xy(
+                            unfiltered_match_info12.matched_kp1_xy, img_inv_M
+                        )
+                        unfiltered_match_info12.matched_kp2_xy = warp_tools.warp_xy(
+                            unfiltered_match_info12.matched_kp2_xy, prev_img_inv_M
+                        )
 
-                        unfiltered_match_info21.matched_kp1_xy = warp_tools.warp_xy(unfiltered_match_info21.matched_kp1_xy, prev_img_inv_M)
-                        unfiltered_match_info21.matched_kp2_xy = warp_tools.warp_xy(unfiltered_match_info21.matched_kp2_xy, img_inv_M)
+                        unfiltered_match_info21.matched_kp1_xy = warp_tools.warp_xy(
+                            unfiltered_match_info21.matched_kp1_xy, prev_img_inv_M
+                        )
+                        unfiltered_match_info21.matched_kp2_xy = warp_tools.warp_xy(
+                            unfiltered_match_info21.matched_kp2_xy, img_inv_M
+                        )
 
                         unfiltered_reflected_matches12.append(unfiltered_match_info12)
                         unfiltered_reflected_matches21.append(unfiltered_match_info21)
@@ -1013,19 +1074,22 @@ class SerialRigidRegistrar(object):
             best_idx = np.argmin(reflected_d_vals)
             best_reflect_M = reflection_M[best_idx]
             best_M = transforms[best_idx]
+
             img_obj.to_prev_A = best_M
             img_obj.reflection_M = best_reflect_M
+            img_obj.to_ref_A = prev_to_ref_A @ img_obj.to_prev_A
+
             prev_M = img_obj.reflection_M @ img_obj.T @ img_obj.to_prev_A
 
             ref_x, ref_y = best_reflect_M[[0, 1], [0, 1]] < 0
             if ref_x or ref_y:
-                msg = f'detected relfections between {img_obj.name} and {prev_img_obj.name} along the'
+                msg = f"detected relfections between {img_obj.name} and {prev_img_obj.name} along the"
                 if ref_x and ref_y:
-                    msg = f'{msg} x and y axes'
+                    msg = f"{msg} x and y axes"
                 elif ref_x:
-                    msg = f'{msg} x axis'
+                    msg = f"{msg} x axis"
                 elif ref_y:
-                    msg = f'{msg} y axis'
+                    msg = f"{msg} y axis"
 
                 valtils.print_warning(msg)
 
@@ -1039,7 +1103,6 @@ class SerialRigidRegistrar(object):
 
             if qt_emitter is not None:
                 qt_emitter.emit(1)
-
 
     def align_to_prev(self, transformer, qt_emitter=None):
         """Use key points to align current image to previous image in the stack
@@ -1064,8 +1127,14 @@ class SerialRigidRegistrar(object):
             prev_img_obj = self.img_obj_list[fixed_idx]
             img_obj.fixed_obj = prev_img_obj
 
-            if fixed_idx == self.reference_img_idx:
-                prev_M = ref_img_obj.T.copy()
+            if self.compose_transforms:
+                if fixed_idx == self.reference_img_idx:
+                    prev_M = ref_img_obj.T.copy()
+
+                prev_to_ref_A = np.identity(3)
+            else:
+                prev_M = prev_img_obj.T.copy()
+                prev_to_ref_A = prev_img_obj.to_ref_A
 
             to_prev_match_info = img_obj.match_dict[prev_img_obj]
             src_xy = warp_tools.warp_xy(to_prev_match_info.matched_kp1_xy, img_obj.T)
@@ -1073,6 +1142,7 @@ class SerialRigidRegistrar(object):
 
             transformer.estimate(dst_xy, src_xy)
             img_obj.to_prev_A = transformer.params
+            img_obj.to_ref_A = prev_to_ref_A @ img_obj.to_prev_A
 
             prev_M = img_obj.T @ img_obj.to_prev_A
 
@@ -1096,8 +1166,7 @@ class SerialRigidRegistrar(object):
 
         """
         ref_img_obj = self.img_obj_list[self.reference_img_idx]
-        ref_warped = warp_tools.warp_img(ref_img_obj.image, M=ref_img_obj.T,
-                                         out_shape_rc=ref_img_obj.padded_shape_rc)
+        ref_warped = warp_tools.warp_img(ref_img_obj.image, M=ref_img_obj.T, out_shape_rc=ref_img_obj.padded_shape_rc)
         if qt_emitter is not None:
             qt_emitter.emit(1)
 
@@ -1105,32 +1174,35 @@ class SerialRigidRegistrar(object):
             img_obj = self.img_obj_list[moving_idx]
             prev_img_obj = self.img_obj_list[fixed_idx]
 
-            if prev_img_obj == ref_img_obj:
-                prev_img = ref_warped
-                prev_M = ref_img_obj.T
-
             M = img_obj.reflection_M @ img_obj.T @ img_obj.to_prev_A
-            warped_img = warp_tools.warp_img(img_obj.image,
-                                             M=M,
-                                             out_shape_rc=img_obj.padded_shape_rc)
+            warped_img = warp_tools.warp_img(img_obj.image, M=M, out_shape_rc=img_obj.padded_shape_rc)
+
+            if self.compose_transforms:
+                if prev_img_obj == ref_img_obj:
+                    prev_img = ref_warped
+                    prev_M = ref_img_obj.T.copy()
+
+                prev_to_ref_A = np.identity(3)
+            else:
+                prev_img = warp_tools.warp_img(
+                    prev_img_obj.image, M=prev_img_obj.T, out_shape_rc=ref_img_obj.padded_shape_rc
+                )
+                prev_M = prev_img_obj.T.copy()
+                prev_to_ref_A = prev_img_obj.to_ref_A
 
             to_prev_match_info = img_obj.match_dict[prev_img_obj]
             before_src_xy = warp_tools.warp_xy(to_prev_match_info.matched_kp1_xy, M)
             before_dst_xy = warp_tools.warp_xy(to_prev_match_info.matched_kp2_xy, prev_M)
-            before_tre, before_med_d = warp_tools.measure_error(before_src_xy,
-                                                                before_dst_xy,
-                                                                warped_img.shape)
+            before_tre, before_med_d = warp_tools.measure_error(before_src_xy, before_dst_xy, warped_img.shape)
 
             # Get mask
             img_mask = np.ones(img_obj.image.shape[0:2], dtype=np.uint8)
-            warped_img_mask = warp_tools.warp_img(img_mask,
-                                                  M=M,
-                                                  out_shape_rc=img_obj.padded_shape_rc)
+            warped_img_mask = warp_tools.warp_img(img_mask, M=M, out_shape_rc=img_obj.padded_shape_rc)
 
             prev_img_mask = np.ones(prev_img_obj.image.shape[0:2], dtype=np.uint8)
-            warped_prev_img_mask = warp_tools.warp_img(prev_img_mask,
-                                                       M=prev_M,
-                                                       out_shape_rc=prev_img_obj.padded_shape_rc)
+            warped_prev_img_mask = warp_tools.warp_img(
+                prev_img_mask, M=prev_M, out_shape_rc=prev_img_obj.padded_shape_rc
+            )
 
             mask = np.zeros(warped_img_mask.shape, dtype=np.uint8)
             mask[(warped_img_mask != 0) & (warped_prev_img_mask != 0)] = 255
@@ -1144,10 +1216,14 @@ class SerialRigidRegistrar(object):
                 fixed_xy = None
 
             with valtils.HiddenPrints():
-                _, optimal_M, _ = affine_optimizer.align(moving=warped_img, fixed=prev_img,
-                                                         mask=mask, initial_M=None,
-                                                         moving_xy=moving_xy,
-                                                         fixed_xy=fixed_xy)
+                _, optimal_M, _ = affine_optimizer.align(
+                    moving=warped_img,
+                    fixed=prev_img,
+                    mask=mask,
+                    initial_M=None,
+                    moving_xy=moving_xy,
+                    fixed_xy=fixed_xy,
+                )
 
             # Keep optimal M if it actually improved alignment
             initial_cst = affine_optimizer.cost_fxn(warped_img, prev_img, mask)
@@ -1155,15 +1231,11 @@ class SerialRigidRegistrar(object):
             after_src_xy = warp_tools.warp_xy(to_prev_match_info.matched_kp1_xy, M @ optimal_M)
             after_dst_xy = warp_tools.warp_xy(to_prev_match_info.matched_kp2_xy, prev_M)
 
-            optimal_reg_img = warp_tools.warp_img(warped_img,
-                                                  M=optimal_M,
-                                                  out_shape_rc=img_obj.padded_shape_rc)
+            optimal_reg_img = warp_tools.warp_img(warped_img, M=optimal_M, out_shape_rc=img_obj.padded_shape_rc)
 
             after_cst = affine_optimizer.cost_fxn(optimal_reg_img, prev_img, mask)
 
-            after_tre, after_med_d = warp_tools.measure_error(after_src_xy,
-                                                              after_dst_xy,
-                                                              warped_img.shape)
+            after_tre, after_med_d = warp_tools.measure_error(after_src_xy, after_dst_xy, warped_img.shape)
 
             if after_cst is not None and initial_cst is not None:
                 lower_cost = after_cst <= initial_cst
@@ -1174,10 +1246,13 @@ class SerialRigidRegistrar(object):
             if lower_cost and lower_d:
                 prev_img = optimal_reg_img
                 img_obj.optimal_M = optimal_M
+                img_obj.to_ref_A = prev_to_ref_A @ img_obj.to_prev_A @ optimal_M
             else:
-                msg = (f"Somehow optimization made things worse. "
-                       f"Cost was {initial_cst} but is now {after_cst}"
-                       f"KP medD was {before_med_d}, but is now {after_med_d}.")
+                msg = (
+                    f"Somehow optimization made things worse. "
+                    f"Cost was {initial_cst} but is now {after_cst}"
+                    f"KP medD was {before_med_d}, but is now {after_med_d}."
+                )
                 valtils.print_warning(msg)
                 prev_img = warped_img
 
@@ -1187,15 +1262,14 @@ class SerialRigidRegistrar(object):
                 qt_emitter.emit(1)
 
     def calc_warped_img_size(self):
-        """Determine the shape of the registered images
-        """
+        """Determine the shape of the registered images"""
         min_x = np.inf
         max_x = 0
         min_y = np.inf
         max_y = 0
         for i in range(self.size):
             img_obj = self.img_obj_list[i]
-            M = img_obj.reflection_M @ img_obj.T @ img_obj.to_prev_A @ img_obj.optimal_M
+            M = img_obj.reflection_M @ img_obj.T @ img_obj.to_ref_A
             img_corners_rc = warp_tools.get_corners_of_image(img_obj.image.shape)
             warped_corners_xy = warp_tools.warp_xy(img_corners_rc[:, ::-1], M)
 
@@ -1210,8 +1284,7 @@ class SerialRigidRegistrar(object):
         return np.array([h, w])
 
     def finalize(self):
-        """Combine transformation matrices and get final shape of registered images
-        """
+        """Combine transformation matrices and get final shape of registered images"""
 
         min_x = np.inf
         max_x = 0
@@ -1222,7 +1295,7 @@ class SerialRigidRegistrar(object):
 
             img_obj = self.img_obj_list[i]
 
-            M = img_obj.reflection_M @ img_obj.T @ img_obj.to_prev_A @ img_obj.optimal_M
+            M = img_obj.reflection_M @ img_obj.T @ img_obj.to_ref_A
             M_list[i] = M
 
             img_corners_rc = warp_tools.get_corners_of_image(img_obj.image.shape)
@@ -1243,12 +1316,9 @@ class SerialRigidRegistrar(object):
             img_obj.crop_T = crop_T
             img_obj.M = M_list[i] @ crop_T
             img_obj.M_inv = np.linalg.inv(img_obj.M)
-            img_obj.registered_img = warp_tools.warp_img(img=img_obj.image,
-                                                         M=img_obj.M,
-                                                         out_shape_rc=(h, w))
+            img_obj.registered_img = warp_tools.warp_img(img=img_obj.image, M=img_obj.M, out_shape_rc=(h, w))
 
             img_obj.registered_shape_rc = img_obj.registered_img.shape[0:2]
-
 
     def wiggle_to_ref(self, transformer):
         """Compose rigid transforms to wiggle image to reference
@@ -1298,7 +1368,6 @@ class SerialRigidRegistrar(object):
             updated_M = img_obj.M @ wiggle_M_list[img_obj.stack_idx]
             img_obj.M = updated_M
 
-
     def clear_unused_matches(self):
         """Clear up space by removing unused matches between Zimages
 
@@ -1311,12 +1380,12 @@ class SerialRigidRegistrar(object):
             if i == 0:
                 prev_img_obj = None
             else:
-                prev_img_obj = self.img_obj_list[i-1]
+                prev_img_obj = self.img_obj_list[i - 1]
 
             if i == self.size - 1:
                 next_img_obj = None
             else:
-                next_img_obj = self.img_obj_list[i+1]
+                next_img_obj = self.img_obj_list[i + 1]
 
             img_obj.reduce(prev_img_obj, next_img_obj)
 
@@ -1354,37 +1423,35 @@ class SerialRigidRegistrar(object):
             temp_current_pts = current_to_prev_matches.matched_kp1_xy
             temp_prev_pts = current_to_prev_matches.matched_kp2_xy
 
-            og_tre_list[i], og_med_d_list[i] = \
-                warp_tools.measure_error(temp_current_pts,
-                                         temp_prev_pts,
-                                         img_obj.image.shape)
+            og_tre_list[i], og_med_d_list[i] = warp_tools.measure_error(
+                temp_current_pts, temp_prev_pts, img_obj.image.shape
+            )
 
             current_pts = warp_tools.warp_xy(temp_current_pts, img_obj.M)
             prev_pts = warp_tools.warp_xy(temp_prev_pts, prev_img_obj.M)
 
-            tre_list[i], med_d_list[i] = \
-                warp_tools.measure_error(current_pts,
-                                         prev_pts,
-                                         img_obj.image.shape)
+            tre_list[i], med_d_list[i] = warp_tools.measure_error(current_pts, prev_pts, img_obj.image.shape)
 
-            similarities = \
-                convert_distance_to_similarity(current_to_prev_matches.match_distances,
-                                               current_to_prev_matches.matched_desc1.shape[0])
+            similarities = convert_distance_to_similarity(
+                current_to_prev_matches.match_distances, current_to_prev_matches.matched_desc1.shape[0]
+            )
 
-            _, weighted_med_d_list[i] = \
-                warp_tools.measure_error(current_pts, prev_pts,
-                                         img_obj.image.shape, similarities)
+            _, weighted_med_d_list[i] = warp_tools.measure_error(
+                current_pts, prev_pts, img_obj.image.shape, similarities
+            )
 
-        summary_df = pd.DataFrame({
-            "from": src_img_names,
-            "to": dst_img_names,
-            "original_D": og_med_d_list,
-            "D": med_d_list,
-            "D_weighted": weighted_med_d_list,
-            "original_TRE": og_tre_list,
-            "TRE": tre_list,
-            "shape": shape_list,
-        })
+        summary_df = pd.DataFrame(
+            {
+                "from": src_img_names,
+                "to": dst_img_names,
+                "original_D": og_med_d_list,
+                "D": med_d_list,
+                "D_weighted": weighted_med_d_list,
+                "original_TRE": og_tre_list,
+                "TRE": tre_list,
+                "shape": shape_list,
+            }
+        )
 
         non_ref_idx = list(range(self.size))
         non_ref_idx.remove(self.reference_img_idx)
@@ -1396,15 +1463,23 @@ class SerialRigidRegistrar(object):
         return summary_df
 
 
-
-def register_images(img_dir, dst_dir=None, name="registrar",
-                    feature_detector=VggFD(),
-                    matcher=Matcher(), transformer=EuclideanTransform(),
-                    affine_optimizer=None,
-                    imgs_ordered=False, reference_img_f=None,
-                    similarity_metric="n_matches",
-                    check_for_reflections=False,
-                    max_scaling=3.0, align_to_reference=False, qt_emitter=None):
+def register_images(
+    img_dir,
+    dst_dir=None,
+    name="registrar",
+    feature_detector=VggFD(),
+    matcher=Matcher(),
+    transformer=EuclideanTransform(),
+    affine_optimizer=None,
+    imgs_ordered=False,
+    reference_img_f=None,
+    similarity_metric="n_matches",
+    check_for_reflections=False,
+    max_scaling=3.0,
+    align_to_reference=False,
+    compose_transforms=False,
+    qt_emitter=None,
+):
     """
     Rigidly align collection of images
 
@@ -1465,6 +1540,15 @@ def register_images(img_dir, dst_dir=None, name="registrar",
         Whether or not images should be aligned to a reference image
         specified by `reference_img_f`.
 
+    compose_transforms: bool, optional
+            Whether or not to compose rigid transformations. If `True`,
+            then an image is rigidly warped an aligned with the reference slide
+            before aligning to the adjacent image. This allows the transformations
+            to accumulate, which may bring distant features together but could
+            also  result  in un-wanted deformations. If `False`, the image
+            not warped before is used as the reference for the adjacent image
+            to be registered to.
+
     qt_emitter : PySide2.QtCore.Signal, optional
         Used to emit signals that update the GUI's progress bars
 
@@ -1483,40 +1567,46 @@ def register_images(img_dir, dst_dir=None, name="registrar",
     tic = time()
     if affine_optimizer is not None:
         if transformer.__class__.__name__ != affine_optimizer.transformation:
-            print(Warning("Transformer is of type ",
-                          transformer.__class__.__name__,
-                          "but affine_optimizer optimizes the",
-                          affine_optimizer.transformation,
-                          ". Setting", transformer.__class__.__name__,
-                          "as the transform to be optimized"))
+            print(
+                Warning(
+                    "Transformer is of type ",
+                    transformer.__class__.__name__,
+                    "but affine_optimizer optimizes the",
+                    affine_optimizer.transformation,
+                    # ". Setting",
+                    # transformer.__class__.__name__,
+                    # "as the transform to be optimized",
+                )
+            )
 
-            affine_optimizer.transformation = transformer.__class__.__name__
+            # affine_optimizer.transformation = transformer.__class__.__name__
 
     if transformer.__class__.__name__ == "EuclideanTransform":
         matcher.scaling = False
     else:
         matcher.scaling = True
 
-    registrar = SerialRigidRegistrar(img_dir,
-                                     imgs_ordered=imgs_ordered,
-                                     reference_img_f=reference_img_f,
-                                     name=name,
-                                     align_to_reference=align_to_reference)
+    registrar = SerialRigidRegistrar(
+        img_dir,
+        imgs_ordered=imgs_ordered,
+        reference_img_f=reference_img_f,
+        name=name,
+        align_to_reference=align_to_reference,
+        compose_transforms=compose_transforms,
+    )
 
     print("\n======== Detecting features\n")
     registrar.generate_img_obj_list(feature_detector, qt_emitter=qt_emitter)
 
     print("\n======== Matching images\n")
     if registrar.aleady_sorted:
-        registrar.match_sorted_imgs(matcher, keep_unfiltered=False,
-                                    qt_emitter=qt_emitter)
+        registrar.match_sorted_imgs(matcher, keep_unfiltered=False, qt_emitter=qt_emitter)
 
         for i, img_obj in enumerate(registrar.img_obj_list):
             img_obj.stack_idx = i
 
     else:
-        registrar.match_imgs(matcher, keep_unfiltered=False,
-                             qt_emitter=qt_emitter)
+        registrar.match_imgs(matcher, keep_unfiltered=False, qt_emitter=qt_emitter)
 
         print("\n======== Sorting images\n")
         registrar.build_metric_matrix(metric=similarity_metric)
@@ -1530,21 +1620,27 @@ def register_images(img_dir, dst_dir=None, name="registrar",
         registrar.update_match_dicts_with_neighbor_filter(transformer, matcher)
 
     if check_for_reflections:
-        registrar.align_to_prev_check_reflections(transformer=transformer,
-                                                  feature_detector=feature_detector,
-                                                  matcher_obj=matcher,
-                                                  keep_unfiltered=False,
-                                                  qt_emitter=qt_emitter)
+        registrar.align_to_prev_check_reflections(
+            transformer=transformer,
+            feature_detector=feature_detector,
+            matcher_obj=matcher,
+            keep_unfiltered=False,
+            qt_emitter=qt_emitter,
+        )
     else:
         registrar.align_to_prev(transformer=transformer, qt_emitter=qt_emitter)
 
     # Check current output shape. If too large, then  registration failed
     for img_obj in registrar.img_obj_list:
         s = transform.SimilarityTransform(img_obj.M).scale
-        if s >= max_scaling or s <= 1/max_scaling:
-            print(Warning(f"Max allowed scaling is {max_scaling},\
+        if s >= max_scaling or s <= 1 / max_scaling:
+            print(
+                Warning(
+                    f"Max allowed scaling is {max_scaling},\
                           but was calculated as being {s}.\
-                          Registration failed. Maybe try using the Euclidean transform."))
+                          Registration failed. Maybe try using the Euclidean transform."
+                )
+            )
             return False
 
     if affine_optimizer is not None:
@@ -1571,15 +1667,13 @@ def register_images(img_dir, dst_dir=None, name="registrar",
 
         print("\n======== Saving results\n")
         pickle_file = os.path.join(registered_data_dir, name + "_registrar.pickle")
-        pickle.dump(registrar, open(pickle_file, 'wb'))
+        pickle.dump(registrar, open(pickle_file, "wb"))
 
         n_digits = len(str(registrar.size))
         for img_obj in registrar.img_obj_list:
-            f_out = "".join([str.zfill(str(img_obj.stack_idx), n_digits),
-                             "_", img_obj.name, ".png"])
+            f_out = "".join([str.zfill(str(img_obj.stack_idx), n_digits), "_", img_obj.name, ".png"])
 
-            io.imsave(os.path.join(registered_img_dir, f_out),
-                      img_obj.registered_img.astype(np.uint8))
+            io.imsave(os.path.join(registered_img_dir, f_out), img_obj.registered_img.astype(np.uint8))
 
     registrar.clear_unused_matches()
     toc = time()

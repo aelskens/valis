@@ -2,30 +2,33 @@
 
 """
 
+import imghdr
+import inspect
+import os
+import pathlib
+import pickle
+from time import time
+
 import numpy as np
+import pandas as pd
+import pyvips
 from skimage import io
 from tqdm import tqdm
-import os
-import imghdr
-from time import time
-import pathlib
-import pandas as pd
-import pickle
-import cv2
-import pyvips
-import inspect
 
-from . import warp_tools
-from . import non_rigid_registrars
-from . import valtils
-from . import serial_rigid
-from . import viz
-from . import preprocessing
+from . import (
+    non_rigid_registrars,
+    preprocessing,
+    serial_rigid,
+    valtils,
+    viz,
+    warp_tools,
+)
 
 IMG_LIST_KEY = "img_list"
 IMG_F_LIST_KEY = "img_f_list"
 IMG_NAME_KEY = "name_list"
 MASK_LIST_KEY = "mask_list"
+
 
 def get_matching_xy_from_rigid_registrar(rigid_registrar, ref_img_name=None):
     """Get matching keypoints to use in serial non-rigid registration
@@ -99,8 +102,7 @@ def get_imgs_from_dir(src_dir):
         List of masks used for registration
     """
 
-    img_f_list = [f for f in os.listdir(src_dir) if
-                  imghdr.what(os.path.join(src_dir, f)) is not None]
+    img_f_list = [f for f in os.listdir(src_dir) if imghdr.what(os.path.join(src_dir, f)) is not None]
 
     valtils.sort_nicely(img_f_list)
 
@@ -148,9 +150,9 @@ def get_imgs_rigid_reg(serial_rigid_reg):
 
         # Moving mask
         temp_mask = np.full_like(img_obj.image, 255)
-        img_mask = warp_tools.warp_img(temp_mask, M=img_obj.M,
-                                       out_shape_rc=img_obj.registered_img.shape,
-                                       interp_method="nearest")
+        img_mask = warp_tools.warp_img(
+            temp_mask, M=img_obj.M, out_shape_rc=img_obj.registered_img.shape, interp_method="nearest"
+        )
         mask_list[i] = img_mask
 
     return img_list, img_f_list, img_names, mask_list
@@ -215,7 +217,7 @@ def get_imgs_from_dict(img_dict):
 
 
 class NonRigidZImage(object):
-    """ Class that store info about an image, including both
+    """Class that store info about an image, including both
     rigid and non-rigid registration parameters
 
     Attributes
@@ -342,8 +344,8 @@ class NonRigidZImage(object):
             init_arg_list = inspect.getfullargspec(non_rigid_reg_class.__init__).args
             reg_arg_list = inspect.getfullargspec(non_rigid_reg_class.register).args
 
-            init_kwargs = {k:v for k, v in params.items() if k in init_arg_list}
-            reg_kwargs = {k:v for k, v in params.items() if k in reg_arg_list}
+            init_kwargs = {k: v for k, v in params.items() if k in init_arg_list}
+            reg_kwargs = {k: v for k, v in params.items() if k in reg_arg_list}
 
         else:
             init_kwargs = {}
@@ -351,8 +353,7 @@ class NonRigidZImage(object):
 
         return init_kwargs, reg_kwargs
 
-    def calc_deformation(self, registered_fixed_image, non_rigid_reg_class,
-                         bk_dxdy=None, params=None, mask=None):
+    def calc_deformation(self, registered_fixed_image, non_rigid_reg_class, bk_dxdy=None, params=None, mask=None):
         """
         Finds the non-rigid deformation fields that align this ("moving") image
         to the "fixed" image
@@ -397,7 +398,7 @@ class NonRigidZImage(object):
             if isinstance(mask, pyvips.Image):
                 reg_mask = warp_tools.vips2numpy(mask)
             else:
-                reg_mask =  mask.copy()
+                reg_mask = mask.copy()
         else:
             reg_mask = None
 
@@ -411,11 +412,9 @@ class NonRigidZImage(object):
                 for_reg_dxdy = bk_dxdy
 
             if self.reg_obj.from_rigid_reg:
-                for_reg_dxdy = warp_tools.remove_invasive_displacements(for_reg_dxdy,
-                                                                        M=M,
-                                                                        src_shape_rc=unwarped_shape,
-                                                                        out_shape_rc=og_reg_shape_rc
-                                                                        )
+                for_reg_dxdy = warp_tools.remove_invasive_displacements(
+                    for_reg_dxdy, M=M, src_shape_rc=unwarped_shape, out_shape_rc=og_reg_shape_rc
+                )
 
             moving_img = warp_tools.warp_img(self.image, bk_dxdy=for_reg_dxdy)
             if reg_mask is not None:
@@ -434,8 +433,11 @@ class NonRigidZImage(object):
 
         non_rigid_reg = non_rigid_reg_class(params=init_kwargs)
 
-        if self.moving_xy is not None and self.fixed_xy is not None and \
-           issubclass(non_rigid_reg_class, non_rigid_registrars.NonRigidRegistrarXY):
+        if (
+            self.moving_xy is not None
+            and self.fixed_xy is not None
+            and issubclass(non_rigid_reg_class, non_rigid_registrars.NonRigidRegistrarXY)
+        ):
             if for_reg_dxdy is not None:
                 # Update positions #
                 fwd_dxdy = warp_tools.get_inverse_field(for_reg_dxdy)
@@ -451,25 +453,20 @@ class NonRigidZImage(object):
         xy_args = {"moving_xy": moving_xy, "fixed_xy": fixed_xy}
         reg_kwargs.update(xy_args)
 
-        warped_moving, moving_grid_img, moving_bk_dxdy = \
-            non_rigid_reg.register(moving_img=moving_img,
-                                   fixed_img=registered_fixed_image,
-                                   mask=reg_mask,
-                                   **reg_kwargs)
+        warped_moving, moving_grid_img, moving_bk_dxdy = non_rigid_reg.register(
+            moving_img=moving_img, fixed_img=registered_fixed_image, mask=reg_mask, **reg_kwargs
+        )
 
         if self.reg_obj.from_rigid_reg:
-            moving_bk_dxdy = warp_tools.remove_invasive_displacements(moving_bk_dxdy,
-                                                                      M=M,
-                                                                      src_shape_rc=unwarped_shape,
-                                                                      out_shape_rc=og_reg_shape_rc
-                                                                      )
+            moving_bk_dxdy = warp_tools.remove_invasive_displacements(
+                moving_bk_dxdy, M=M, src_shape_rc=unwarped_shape, out_shape_rc=og_reg_shape_rc
+            )
 
         if not self.check_if_vips(moving_bk_dxdy):
             if reg_mask is not None:
                 # Only add new transformations
                 moving_bk_dxdy = self.mask_dxdy(moving_bk_dxdy, reg_mask)
-            bk_dxdy_from_ref = np.array([bk_dxdy[0] + moving_bk_dxdy[0],
-                                         bk_dxdy[1] + moving_bk_dxdy[1]])
+            bk_dxdy_from_ref = np.array([bk_dxdy[0] + moving_bk_dxdy[0], bk_dxdy[1] + moving_bk_dxdy[1]])
         else:
             if reg_mask is not None:
                 moving_bk_dxdy = self.mask_dxdy(moving_bk_dxdy, reg_mask)
@@ -480,11 +477,9 @@ class NonRigidZImage(object):
             img_bk_dxdy = self.mask_dxdy(img_bk_dxdy, reg_mask)
 
         if self.reg_obj.from_rigid_reg:
-            img_bk_dxdy = warp_tools.remove_invasive_displacements(img_bk_dxdy,
-                                                                   M=M,
-                                                                   src_shape_rc=unwarped_shape,
-                                                                   out_shape_rc=og_reg_shape_rc
-                                                                   )
+            img_bk_dxdy = warp_tools.remove_invasive_displacements(
+                img_bk_dxdy, M=M, src_shape_rc=unwarped_shape, out_shape_rc=og_reg_shape_rc
+            )
         self.bk_dxdy = img_bk_dxdy
         if hasattr(non_rigid_reg, "fwd_dxdy"):
             # Already calculated
@@ -496,9 +491,7 @@ class NonRigidZImage(object):
             # If dxdy is a pyvips.Image, it's likely the displacement is too large to draw
             self.warped_grid = viz.color_displacement_grid(*self.bk_dxdy)
 
-        self.registered_img = warp_tools.warp_img(self.image,
-                                                  bk_dxdy=self.bk_dxdy,
-                                                  out_shape_rc=self.shape)
+        self.registered_img = warp_tools.warp_img(self.image, bk_dxdy=self.bk_dxdy, out_shape_rc=self.shape)
 
         return bk_dxdy_from_ref
 
@@ -568,8 +561,16 @@ class SerialNonRigidRegistrar(object):
 
     """
 
-    def __init__(self, src, reference_img_f=None, moving_to_fixed_xy=None,
-                 mask=None, name=None, align_to_reference=False, compose_transforms=True):
+    def __init__(
+        self,
+        src,
+        reference_img_f=None,
+        moving_to_fixed_xy=None,
+        mask=None,
+        name=None,
+        align_to_reference=False,
+        compose_transforms=True,
+    ):
         """
         Parameters
         ----------
@@ -668,12 +669,13 @@ class SerialNonRigidRegistrar(object):
 
         if self.align_to_reference is False and reference_img_f is not None:
             og_ref_name = valtils.get_name(reference_img_f)
-            msg = (f"The reference was specified as {og_ref_name} ",
-                   f"but `align_to_reference` is `False`, and so images will be aligned serially. ",
-                   f"If you would like all images to be directly aligned to {og_ref_name}, "
-                   f"then set `align_to_reference` to `True`")
+            msg = (
+                f"The reference was specified as {og_ref_name} ",
+                f"but `align_to_reference` is `False`, and so images will be aligned serially. ",
+                f"If you would like all images to be directly aligned to {og_ref_name}, "
+                f"then set `align_to_reference` to `True`",
+            )
             valtils.print_warning(msg)
-
 
     def get_shape(self, img):
         if isinstance(img, pyvips.Image):
@@ -688,19 +690,16 @@ class SerialNonRigidRegistrar(object):
         for nr_img_obj in self.non_rigid_obj_list:
             temp_mask[nr_img_obj.image > 0] = 255
 
-        mask = warp_tools.bbox2mask(*warp_tools.xy2bbox(
-                                    warp_tools.mask2xy(temp_mask)),
-                                    temp_mask.shape)
+        mask = warp_tools.bbox2mask(*warp_tools.xy2bbox(warp_tools.mask2xy(temp_mask)), temp_mask.shape)
         return mask
 
     def set_mask(self, mask):
-        """Set mask and get its bounding box
-        """
+        """Set mask and get its bounding box"""
 
         if mask is not None:
             if isinstance(mask, bool) and self.from_rigid_reg:
                 mask = self.src.overlap_mask
-            mask = np.clip(mask.astype(int)*255, 0, 255).astype(np.uint8)
+            mask = np.clip(mask.astype(int) * 255, 0, 255).astype(np.uint8)
 
         else:
             mask = self.create_mask()
@@ -710,23 +709,18 @@ class SerialNonRigidRegistrar(object):
         self.mask_bbox_xywh = mask_bbox_xywh
 
     def generate_non_rigid_obj_list(self, reference_img_f=None, moving_to_fixed_xy=None):
-        """Create non_rigid_obj_list
-
-        """
+        """Create non_rigid_obj_list"""
 
         if self.from_rigid_reg:
-            img_list, img_f_list, img_names, mask_list = \
-                get_imgs_rigid_reg(self.src)
+            img_list, img_f_list, img_names, mask_list = get_imgs_rigid_reg(self.src)
         else:
             if isinstance(self.src, str):
-                img_list, img_f_list, img_names, mask_list = \
-                    get_imgs_from_dir(self.src)
+                img_list, img_f_list, img_names, mask_list = get_imgs_from_dir(self.src)
                 # overwrite `src` because all info now in NonRigidZImages
                 self.src = "dictionary"
 
             elif isinstance(self.src, dict):
-                img_list, img_f_list, img_names, mask_list = \
-                    get_imgs_from_dict(self.src)
+                img_list, img_f_list, img_names, mask_list = get_imgs_from_dict(self.src)
 
         self.size = len(img_list)
         self.shape = self.get_shape(img_list[0])
@@ -747,8 +741,7 @@ class SerialNonRigidRegistrar(object):
 
         if self.from_rigid_reg and isinstance(moving_to_fixed_xy, bool):
             if moving_to_fixed_xy:
-                moving_to_fixed_xy = \
-                    get_matching_xy_from_rigid_registrar(self.src, reference_name)
+                moving_to_fixed_xy = get_matching_xy_from_rigid_registrar(self.src, reference_name)
             else:
                 moving_to_fixed_xy = None
 
@@ -756,12 +749,11 @@ class SerialNonRigidRegistrar(object):
         for i, img in enumerate(img_list):
             img_shape = self.get_shape(img)
 
-            assert np.all(img_shape == self.shape), \
-                valtils.print_warning("Images must all have the shape")
+            assert np.all(img_shape == self.shape), valtils.print_warning("Images must all have the shape")
 
             img_name = img_names[i]
             mask = mask_list[i]
-            
+
             moving_xy = None
             fixed_xy = None
             if moving_to_fixed_xy is not None and img_name != reference_img_f:
@@ -773,10 +765,9 @@ class SerialNonRigidRegistrar(object):
                     msg = "moving_to_fixed_xy is not a dictionary. Will be ignored"
                     valtils.print_warning(msg)
 
-            nr_obj = NonRigidZImage(self, img, img_name, stack_idx=i,
-                                    moving_xy=moving_xy,
-                                    fixed_xy=fixed_xy,
-                                    mask=mask)
+            nr_obj = NonRigidZImage(
+                self, img, img_name, stack_idx=i, moving_xy=moving_xy, fixed_xy=fixed_xy, mask=mask
+            )
 
             if i == ref_img_idx:
                 # Set reference image attributes #
@@ -816,7 +807,6 @@ class SerialNonRigidRegistrar(object):
 
         return updated_params
 
-
     def register_serial(self, non_rigid_reg_class, non_rigid_reg_params=None, img_params=None):
         """Non-rigidly align images in serial
         Parameters
@@ -848,7 +838,7 @@ class SerialNonRigidRegistrar(object):
 
             if moving_obj.mask is not None:
                 if self.mask is not None:
-                    reg_mask = warp_tools.combine_masks(self.mask, moving_obj.mask, op="and")
+                    reg_mask = preprocessing.combine_masks(self.mask, moving_obj.mask, op="and")
                 else:
                     reg_mask = moving_obj.mask
 
@@ -859,13 +849,13 @@ class SerialNonRigidRegistrar(object):
                 reg_mask is None
 
             nr_reg_params = self.update_img_params(non_rigid_reg_params, img_params, moving_obj.name)
-            updated_dxdy = moving_obj.calc_deformation(registered_fixed_image=fixed_obj.registered_img,
-                                        non_rigid_reg_class=non_rigid_reg_class,
-                                        bk_dxdy=current_dxdy,
-                                        params=nr_reg_params,
-                                        mask=reg_mask
-                                        )
-
+            updated_dxdy = moving_obj.calc_deformation(
+                registered_fixed_image=fixed_obj.registered_img,
+                non_rigid_reg_class=non_rigid_reg_class,
+                bk_dxdy=current_dxdy,
+                params=nr_reg_params,
+                mask=reg_mask,
+            )
 
     def register_to_ref(self, non_rigid_reg_class, non_rigid_reg_params=None, img_params=None):
         """Non-rigidly align images to a reference image
@@ -895,10 +885,7 @@ class SerialNonRigidRegistrar(object):
 
             nr_reg_params = self.update_img_params(non_rigid_reg_params, img_params, moving_obj.name)
 
-            moving_obj.calc_deformation(ref_img,
-                                        non_rigid_reg_class,
-                                        params=nr_reg_params,
-                                        mask=overlap_mask)
+            moving_obj.calc_deformation(ref_img, non_rigid_reg_class, params=nr_reg_params, mask=overlap_mask)
 
     def register_groupwise(self, non_rigid_reg_class, non_rigid_reg_params=None):
         """Non-rigidly align images as a group
@@ -958,7 +945,7 @@ class SerialNonRigidRegistrar(object):
         """
 
         if img_params is not None:
-            named_img_params = {valtils.get_name(k):v for k, v in img_params.items()}
+            named_img_params = {valtils.get_name(k): v for k, v in img_params.items()}
         else:
             named_img_params = None
 
@@ -969,8 +956,7 @@ class SerialNonRigidRegistrar(object):
         else:
             self.register_serial(non_rigid_reg_class, non_rigid_reg_params, img_params=named_img_params)
 
-        self.non_rigid_obj_dict = {img_obj.name: img_obj for img_obj
-                                   in self.non_rigid_obj_list}
+        self.non_rigid_obj_dict = {img_obj.name: img_obj for img_obj in self.non_rigid_obj_list}
 
     def summarize(self):
         """Summarize alignment error
@@ -1004,33 +990,29 @@ class SerialNonRigidRegistrar(object):
             dst_img_names[moving_idx] = fixed_obj.name
             shape_list[moving_idx] = moving_obj.image.shape
 
-            og_tre_list[moving_idx], og_med_d_list[moving_idx] = \
-                warp_tools.measure_error(moving_obj.moving_xy,
-                                         moving_obj.fixed_xy,
-                                         moving_obj.image.shape)
+            og_tre_list[moving_idx], og_med_d_list[moving_idx] = warp_tools.measure_error(
+                moving_obj.moving_xy, moving_obj.fixed_xy, moving_obj.image.shape
+            )
 
-            warped_moving_xy = warp_tools.warp_xy(moving_obj.moving_xy,
-                                                  M=None,
-                                                  fwd_dxdy=moving_obj.fwd_dxdy)
+            warped_moving_xy = warp_tools.warp_xy(moving_obj.moving_xy, M=None, fwd_dxdy=moving_obj.fwd_dxdy)
 
-            warped_fixed_xy = warp_tools.warp_xy(moving_obj.fixed_xy,
-                                                 M=None,
-                                                 fwd_dxdy=moving_obj.fwd_dxdy)
+            warped_fixed_xy = warp_tools.warp_xy(moving_obj.fixed_xy, M=None, fwd_dxdy=moving_obj.fwd_dxdy)
 
-            tre_list[moving_idx], med_d_list[moving_idx] = \
-                warp_tools.measure_error(warped_moving_xy,
-                                         warped_fixed_xy,
-                                         moving_obj.image.shape)
+            tre_list[moving_idx], med_d_list[moving_idx] = warp_tools.measure_error(
+                warped_moving_xy, warped_fixed_xy, moving_obj.image.shape
+            )
 
-        summary_df = pd.DataFrame({
-            "from": src_img_names,
-            "to": dst_img_names,
-            "original_D": og_med_d_list,
-            "D": med_d_list,
-            "original_TRE": og_tre_list,
-            "TRE": tre_list,
-            "shape": shape_list,
-        })
+        summary_df = pd.DataFrame(
+            {
+                "from": src_img_names,
+                "to": dst_img_names,
+                "original_D": og_med_d_list,
+                "D": med_d_list,
+                "original_TRE": og_tre_list,
+                "TRE": tre_list,
+                "shape": shape_list,
+            }
+        )
         to_summarize_idx = [i for i in range(self.size) if i != self.ref_img_idx]
         summary_df["series_d"] = warp_tools.calc_total_error(np.array(med_d_list)[to_summarize_idx])
         summary_df["series_tre"] = warp_tools.calc_total_error(np.array(tre_list)[to_summarize_idx])
@@ -1041,11 +1023,20 @@ class SerialNonRigidRegistrar(object):
         return summary_df
 
 
-def register_images(src, non_rigid_reg_class=non_rigid_registrars.OpticalFlowWarper,
-                    non_rigid_reg_params=None, dst_dir=None,
-                    reference_img_f=None, moving_to_fixed_xy=None,
-                    mask=None, name=None, align_to_reference=False,
-                    img_params=None, compose_transforms=True, qt_emitter=None):
+def register_images(
+    src,
+    non_rigid_reg_class=non_rigid_registrars.OpticalFlowWarper,
+    non_rigid_reg_params=None,
+    dst_dir=None,
+    reference_img_f=None,
+    moving_to_fixed_xy=None,
+    mask=None,
+    name=None,
+    align_to_reference=False,
+    img_params=None,
+    compose_transforms=True,
+    qt_emitter=None,
+):
     """
     Parameters
     ----------
@@ -1130,11 +1121,15 @@ def register_images(src, non_rigid_reg_class=non_rigid_registrars.OpticalFlowWar
     """
 
     tic = time()
-    nr_reg = SerialNonRigidRegistrar(src=src, reference_img_f=reference_img_f,
-                                     moving_to_fixed_xy=moving_to_fixed_xy,
-                                     mask=mask, name=name,
-                                     align_to_reference=align_to_reference,
-                                     compose_transforms=compose_transforms)
+    nr_reg = SerialNonRigidRegistrar(
+        src=src,
+        reference_img_f=reference_img_f,
+        moving_to_fixed_xy=moving_to_fixed_xy,
+        mask=mask,
+        name=name,
+        align_to_reference=align_to_reference,
+        compose_transforms=compose_transforms,
+    )
 
     nr_reg.register(non_rigid_reg_class, non_rigid_reg_params, img_params=img_params)
 
@@ -1152,16 +1147,14 @@ def register_images(src, non_rigid_reg_class=non_rigid_registrars.OpticalFlowWar
             summary_df.to_csv(summary_file, index=False)
 
         pickle_file = os.path.join(registered_data_dir, name + "_non_rigid_registrar.pickle")
-        pickle.dump(nr_reg, open(pickle_file, 'wb'))
+        pickle.dump(nr_reg, open(pickle_file, "wb"))
 
         for img_obj in nr_reg.non_rigid_obj_list:
             f_out = f"{img_obj.name}.png"
 
-            io.imsave(os.path.join(registered_img_dir, f_out),
-                      img_obj.registered_img.astype(np.uint8))
+            io.imsave(os.path.join(registered_img_dir, f_out), img_obj.registered_img.astype(np.uint8))
 
-            colord_tri_grid = viz.color_displacement_tri_grid(img_obj.bk_dxdy[0],
-                                                              img_obj.bk_dxdy[1])
+            colord_tri_grid = viz.color_displacement_tri_grid(img_obj.bk_dxdy[0], img_obj.bk_dxdy[1])
 
             io.imsave(os.path.join(registered_grids_dir, f_out), colord_tri_grid)
 
