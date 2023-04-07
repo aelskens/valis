@@ -531,6 +531,9 @@ class MetaData(object):
     pixel_physical_size_xyu :
         Physical size per pixel and the unit.
 
+    nominal_magnification :
+        The nominal magnification at full-scale.
+
     channel_names : list
         List of channel names. None if image is RGB
 
@@ -570,6 +573,7 @@ class MetaData(object):
         self.slide_dimensions = []
         self.is_rgb = None
         self.pixel_physical_size_xyu = []
+        self.nominal_magnification = None
         self.channel_names = None
         self.n_channels = 0
         self.original_xml = None
@@ -1024,6 +1028,7 @@ class BioFormatsSlideReader(SlideReader):
                 else:
                     series_meta.pyvips_interpretation = "multiband"
                 series_meta.pixel_physical_size_xyu = self._get_pixel_physical_size(rdr, meta)
+                series_meta.nominal_magnification = self._get_nominal_magnification(meta)
                 series_meta.bf_pixel_type = str(rdr.getPixelType())
                 series_meta.is_little_endian = rdr.isLittleEndian()
                 series_meta.original_xml = str(meta_xml)
@@ -1209,6 +1214,26 @@ class BioFormatsSlideReader(SlideReader):
         res_xyu = (x_res, y_res, phys_unit)
 
         return res_xyu
+
+    def _get_nominal_magnification(self, meta):
+        """Get nominal magnification.
+
+        Parameters
+        ----------
+        meta : loci.formats.ome.OMEPyramidStore
+            Used to read metadata.
+
+        Returns
+        -------
+        mag : float, None
+            The retrieved nominal maginfication.
+        """
+        try:
+            mag = meta.getObjectiveNominalMagnification(0, 0)
+        except:
+            mag = None
+
+        return mag
 
     def _get_channel_names(self, rdr, meta):
         """Get channel names of image

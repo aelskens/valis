@@ -1470,6 +1470,10 @@ class Valis(object):
         parameter, as it determines the size of of the image in which
         features will be detected and displacement fields computed.
 
+    processed_image_magnification : float, optional
+            The target magnification at which the images will be extracted for rigid
+            registration.
+
     reference_img_f : str
         Filename of image that will be treated as the center of the stack.
         If None, the index of the middle image will be the reference.
@@ -1631,6 +1635,7 @@ class Valis(object):
         max_image_dim_px=DEFAULT_MAX_IMG_DIM,
         max_processed_image_dim_px=DEFAULT_MAX_PROCESSED_IMG_SIZE,
         max_non_rigid_registartion_dim_px=DEFAULT_MAX_PROCESSED_IMG_SIZE,
+        processed_image_magnification=None,
         thumbnail_size=DEFAULT_THUMBNAIL_SIZE,
         norm_method=DEFAULT_NORM_METHOD,
         qt_emitter=None,
@@ -1795,10 +1800,14 @@ class Valis(object):
             features will be detected and displacement fields computed.
 
         max_non_rigid_registartion_dim_px : int, optional
-             Maximum width or height of images used for non-rigid registration.
-             Larger values may yeild more accurate results, at the expense of
-             speed and memory. There is also a practical limit, as the specified
-             size may be too large to fit in memory.
+            Maximum width or height of images used for non-rigid registration.
+            Larger values may yeild more accurate results, at the expense of
+            speed and memory. There is also a practical limit, as the specified
+            size may be too large to fit in memory.
+
+        processed_image_magnification : float, optional
+            The target magnification at which the images will be extracted for rigid
+            registration.
 
         mask_dict : dictionary
             Dictionary where key = overlap type (all, overlap, or reference), and
@@ -1862,6 +1871,7 @@ class Valis(object):
         self.max_image_dim_px = max_image_dim_px
         self.max_processed_image_dim_px = max_processed_image_dim_px
         self.max_non_rigid_registartion_dim_px = max_non_rigid_registartion_dim_px
+        self.processed_image_magnification = processed_image_magnification
 
         # Setup rigid registration #
         self.reference_img_idx = None
@@ -2059,6 +2069,7 @@ class Valis(object):
         """
 
         img_types = []
+        max_height, max_width = 0, 0
         self.size = 0
         for f in tqdm.tqdm(self.original_img_list):
             if reader_cls is None:
@@ -2066,20 +2077,39 @@ class Valis(object):
 
             reader = reader_cls(f, series=series)
 
-            slide_dims = reader.metadata.slide_dimensions
-            levels_in_range = np.where(slide_dims.max(axis=1) < self.max_image_dim_px)[0]
-            if len(levels_in_range) > 0:
-                level = levels_in_range[0]
+            if not self.processed_image_magnification or not reader.metadata.nominal_magnification:
+                slide_dims = reader.metadata.slide_dimensions
+                levels_in_range = np.where(slide_dims.max(axis=1) < self.max_image_dim_px)[0]
+                if len(levels_in_range) > 0:
+                    level = levels_in_range[0]
+                else:
+                    level = len(slide_dims) - 1
+
+                vips_img = reader.slide2vips(level=level)
+
+                scaling = np.min(self.max_image_dim_px / np.array([vips_img.width, vips_img.height]))
+                if scaling < 1:
+                    vips_img = warp_tools.rescale_img(vips_img, scaling)
             else:
-                level = len(slide_dims) - 1
+                # Get the best level
+                level = self.get_best_level_for_magnification(reader.metadata)
 
-            vips_img = reader.slide2vips(level=level)
+                vips_img = reader.slide2vips(level=level)
 
-            scaling = np.min(self.max_image_dim_px / np.array([vips_img.width, vips_img.height]))
-            if scaling < 1:
-                vips_img = warp_tools.rescale_img(vips_img, scaling)
+                factor = self.get_resizing_factor(reader.metadata, level)
+
+                vips_img = warp_tools.resize_img(
+                    vips_img, (int(vips_img.height * factor), int(vips_img.width * factor))
+                )
 
             img = warp_tools.vips2numpy(vips_img)
+
+            # Update the maximum dimensions of the image serie
+            if img.shape[0] > max_height:
+                max_height = img.shape[0]
+
+            if img.shape[1] > max_width:
+                max_width = img.shape[1]
 
             slide_obj = Slide(f, img, self, reader)
             slide_obj.crop = self.crop
@@ -2103,6 +2133,10 @@ class Valis(object):
             self.slide_dict[slide_obj.name] = slide_obj
             self.size += 1
 
+        # Pad each slide image to get images with similar dimensions
+        for slide_obj in self.slide_dict.values():
+            slide_obj.image = self.pad(slide_obj.image, (max_height, max_width), 255)
+
         if self.image_type is None:
             unique_img_types = list(set(img_types))
             if len(unique_img_types) > 1:
@@ -2111,6 +2145,115 @@ class Valis(object):
                 self.image_type = unique_img_types[0]
 
         self.check_img_max_dims()
+
+    def get_best_level_for_downsample(self, downsample_levels, target_downsample):
+        """Get the best downsample level for a target downsample factor.
+
+        Parameters
+        ----------
+        downsample_levels : List(float)
+            The disponible downsample levels.
+        target_downsample : float
+            The target downsample level.
+
+        Returns
+        -------
+        index : int
+            The index of the closer dowsample level existing in the disponible downsample levels.
+        """
+
+        for level, ds in enumerate(downsample_levels):
+            if ds > target_downsample:
+                return max(0, level - 1)
+
+        return len(downsample_levels) - 1
+
+    def get_best_level_for_magnification(self, metadata):
+        """Get level that yields the closest magnification to desired one.
+
+        Parameters
+        ----------
+        metadata : valis.slide_io.Metadata()
+            A valis object that contains the slide metadata.
+
+        Returns
+        -------
+        int
+            The index of the downsample level in the disponible ones that yield the
+            closest magnification to the desired one.
+        """
+
+        nominal_magnification = metadata.nominal_magnification
+
+        higher_level_dim = metadata.slide_dimensions[0]
+        downsample_levels = [higher_level_dim[0] / dim[0] for dim in metadata.slide_dimensions]
+
+        return self.get_best_level_for_downsample(
+            downsample_levels, nominal_magnification / self.processed_image_magnification
+        )
+
+    def get_resizing_factor(self, metadata, level):
+        """Get the resizing factor to obtain the desired magnification based on the downsample level.
+
+        Parameters
+        ----------
+        metadata : valis.slide_io.Metadata()
+            A valis object that contains the slide metadata.
+        level : int
+            The index of the downsample level in the disponible ones that yield the
+            closest magnification to the desired one.
+
+        Returns
+        -------
+        factor : float
+            The desired resizing factor.
+        """
+
+        nominal_magnification = metadata.nominal_magnification
+        downsample = (metadata.slide_dimensions[0] / metadata.slide_dimensions[level])[0]
+
+        factor = downsample / (nominal_magnification / self.processed_image_magnification)
+
+        return factor
+
+    def pad(self, im, target_size_rc, pad_value=255):
+        """Add padding to the image in order to have images of the same size.
+
+        Parameters
+        ----------
+        im : ndarray
+            Input image.
+        target_size_rc : Tuple(int)
+            The target size as (target_height, target_width).
+        pad_value : int, optional
+            The padding value, by default 255.
+
+        Returns
+        -------
+        im : ndarray
+            The padded image.
+        """
+
+        def correct_uneven_padding(expected_pad):
+            """Correct padding in the case of uneven complete padding."""
+            return expected_pad - 2 * (expected_pad // 2)
+
+        complete_pad_h, complete_pad_w = np.array(target_size_rc) - np.array(im.shape[:2])
+
+        pad_h, pad_w = complete_pad_h // 2, complete_pad_w // 2
+
+        im = np.pad(
+            im[..., :3],
+            (
+                (pad_h, pad_h + correct_uneven_padding(complete_pad_h)),
+                (pad_w, pad_w + correct_uneven_padding(complete_pad_w)),
+                (0, 0),
+            ),
+            "constant",
+            constant_values=pad_value,
+        )
+
+        return im
 
     def check_img_max_dims(self):
         """Ensure that all images have similar sizes.
@@ -2124,6 +2267,10 @@ class Valis(object):
         img_max_dims = og_img_sizes_wh.max(axis=1)
         min_max_wh = img_max_dims.min()
         scaling_for_og_imgs = min_max_wh / img_max_dims
+
+        if self.processed_image_magnification:
+            self.max_image_dim_px = min_max_wh
+            self.max_processed_image_dim_px = min_max_wh
 
         if np.any(scaling_for_og_imgs < 1):
             msg = f"Smallest image is less than max_image_dim_px. parameter max_image_dim_px is being set to {min_max_wh}"
